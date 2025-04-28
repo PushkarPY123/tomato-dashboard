@@ -1,114 +1,168 @@
-# streamlit_app.py
-
-import streamlit as st
-import pandas as pd
+import os
+import re
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
+from datetime import date
 
-from prophet import Prophet
-from xgboost import XGBRegressor
-from sklearn.metrics import mean_squared_error
+# ─── 0) YOUR PROJECT FOLDER ─────────────────────────────────────────────────
+data_dir = r"C:\Users\neera\OneDrive\Desktop\New Project"
 
-st.set_page_config(layout="wide", page_title="🍅 Tomato Price Dashboard")
-st.title("🍅 Tomato Price Dashboard")
-
-# 1) Upload & load data
-uploaded = st.sidebar.file_uploader(
-    "📥 Upload your enriched tomato CSV",
-    type="csv",
-)
-if not uploaded:
-    st.warning("Please upload your enriched CSV to proceed.")
+# ─── 1) Auto-locate the tomato CSV ───────────────────────────────────────────
+tomato_file = None
+for fn in os.listdir(data_dir):
+    if re.match(r"(?i)tomato.*\.csv", fn):
+        sample = pd.read_csv(os.path.join(data_dir, fn), nrows=3)
+        if any(re.search(r"date", c, re.I) for c in sample.columns):
+            tomato_file = fn
+            break
+if tomato_file is None:
+    st.error("No `tomato*.csv` with a date column found in data_dir")
     st.stop()
 
+# ─── 2) Detect date / price / centre columns ────────────────────────────────
+tmp = pd.read_csv(os.path.join(data_dir, tomato_file), nrows=5)
+date_col = next(c for c in tmp.columns if re.search(r"date", c, re.I))
+try:
+    price_col = next(c for c in tmp.columns if re.search(r"price", c, re.I))
+except StopIteration:
+    numerics = tmp.select_dtypes(include=[np.number]).columns.tolist()
+    price_col = numerics[0] if numerics else None
+    if price_col is None:
+        st.error("No numeric column found to use as Price")
+        st.stop()
+others = [c for c in tmp.columns if c not in {date_col, price_col}]
+objcols = tmp[others].select_dtypes(include=["object"]).columns.tolist()
+centre_col = objcols[0] if objcols else others[0] if others else None
+if centre_col is None:
+    st.error("Cannot detect a centre/market column")
+    st.stop()
+
+# ─── 3) Load & rename tomato data ────────────────────────────────────────────
 @st.cache_data
-def load_data(f) -> pd.DataFrame:
-    df = pd.read_csv(f, parse_dates=["Date"])
-    # ensure Month & index
-    df["Month"] = df["Date"].dt.month
-    df.set_index(["Center", "Date"], inplace=True)
-    return df
+def load_tomato():
+    df = pd.read_csv(
+        os.path.join(data_dir, tomato_file),
+        usecols=[date_col, price_col, centre_col],
+        parse_dates=[date_col],
+    )
+    return df.rename(columns={date_col: "Date", price_col: "Price", centre_col: "Center"})
+tomato = load_tomato()
 
-data = load_data(uploaded)
-centres = data.index.get_level_values(0).unique()
+# ─── 4) Monthly mean price by centre ────────────────────────────────────────
+tomato["Date"] = tomato["Date"].dt.to_period("M").dt.to_timestamp()
+price_df = (
+    tomato
+    .groupby(["Center", "Date"])['Price']
+    .mean()
+    .reset_index()
+)
 
-# 2) Sidebar controls
-centre        = st.sidebar.selectbox("🏷️ Select Centre", centres)
-rain_shock    = st.sidebar.slider("🌧️ Rainfall shock (%)", -50, 50, 0)
-storage_credit= st.sidebar.number_input("💰 Storage credit (₹/quintal)", min_value=0.0, value=0.0, step=10.0)
-cold_units    = st.sidebar.slider("❄️ Cold-chain units", 0, 100, 0)
+# ─── 5) Load weather series (rain & temp) ───────────────────────────────────
+MONTH_ABBRS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
 
-# 3) Prepare series for this centre
-horizon = 12
-dfc = data.xs(centre).copy()
+def load_monthly(fn, colname):
+    df = pd.read_csv(os.path.join(data_dir, fn))
+    ycol = next(c for c in df.columns if re.search(r"year", c, re.I))
+    month_cols = [c for c in df.columns if c[:3].title() in MONTH_ABBRS]
+    long = (
+        df.melt(id_vars=[ycol], value_vars=month_cols, var_name="Mon", value_name=colname)
+          .dropna(subset=[colname])
+    )
+    long["Mon"] = long["Mon"].str[:3].str.title()
+    long = long[long["Mon"].isin(MONTH_ABBRS)]
+    long["Date"] = pd.to_datetime(
+        long[ycol].astype(int).astype(str) + "-" + long["Mon"],
+        format="%Y-%b"
+    )
+    return long[["Date", colname]].sort_values("Date")
 
-# apply rainfall shock
-dfc["Rain_adj"] = dfc["Rainfall"] * (1 + rain_shock/100.0)
+rain_df = load_monthly("rainfall.csv", "Rainfall")
+temp_df = load_monthly("temperature.csv", "Temperature")
 
-# feature set
-feat_cols = ["Rain_adj", "Temperature", "Month", "Distance_km"]
+# ─── 6) Load centre distances ────────────────────────────────────────────────
+dist_df = pd.read_csv(os.path.join(data_dir, "center_distances.csv"))
+if any(c.lower() == "centre" for c in dist_df.columns):
+    dist_df = dist_df.rename(columns={next(c for c in dist_df.columns if c.lower()=="centre"): "Center"})
+elif any(c.lower() == "center" for c in dist_df.columns):
+    dist_df = dist_df.rename(columns={next(c for c in dist_df.columns if c.lower()=="center"): "Center"})
+else:
+    st.error("No centre/center column in center_distances.csv")
+    st.stop()
 
-# split train/test
-train = dfc.iloc[:-horizon].dropna(subset=["Price"])
-test  = dfc.iloc[-horizon:].dropna(subset=["Price"])
+# ─── 7) Merge everything together ───────────────────────────────────────────
+df = (
+    price_df
+    .merge(rain_df, on="Date", how="left")
+    .merge(temp_df, on="Date", how="left")
+    .merge(dist_df, on="Center", how="left")
+)
 
-X_train = train[feat_cols]
-y_train = train["Price"]
-X_test  = test[feat_cols]
-y_test  = test["Price"]
-dates_test = test.index
+# ─── 8) Feature engineering ─────────────────────────────────────────────────
+df["Time_to_Market_proxy"] = df["Distance_km"] / 500.0
+df = df.sort_values(["Center", "Date"]).set_index(["Center", "Date"])
+df["Volatility_4m"]  = df.groupby(level=0)["Price"].rolling(4).std().reset_index(0, drop=True)
+df["Volatility_12m"] = df.groupby(level=0)["Price"].rolling(12).std().reset_index(0, drop=True)
+for lag in (1, 2):
+    df[f"Rainfall_lag{lag}"]    = df.groupby(level=0)["Rainfall"].shift(lag)
+    df[f"Temperature_lag{lag}"] = df.groupby(level=0)["Temperature"].shift(lag)
 
-# 4) Train XGBoost
-xgb = XGBRegressor(random_state=0)
-xgb.fit(X_train, y_train)
-xgb_pred = xgb.predict(X_test)
+dates = df.index.get_level_values("Date")
+df["Lockdown_2020Q2"]  = ((dates >= pd.Timestamp("2020-04-01")) & (dates <= pd.Timestamp("2020-06-30"))).astype(int)
+df["Onion_Export_Ban"] = 0
+df = df.groupby(level=0, group_keys=False).apply(lambda d: d.ffill().bfill())
 
-# 5) Train Prophet
-prop_df = train.reset_index()[["Date","Price","Rain_adj","Temperature"]]
-prop_df.columns = ["ds","y","Rain_adj","Temperature"]
-m = Prophet(yearly_seasonality=True)
-m.add_regressor("Rain_adj")
-m.add_regressor("Temperature")
-m.fit(prop_df)
+# ─── 9) Export enriched CSV (run once) ───────────────────────────────────────
+out = df.reset_index()
+out = out.loc[:, ~out.columns.duplicated()]
+out.to_csv(os.path.join(data_dir, "enriched_tomato.csv"), index=False)
 
-future = m.make_future_dataframe(periods=horizon, freq="M")
-# align regressors
-future["Rain_adj"]     = dfc["Rain_adj"].reindex(future["ds"]).values
-future["Temperature"]  = dfc["Temperature"].reindex(future["ds"]).values
+# ─── 10) STREAMLIT DASHBOARD ─────────────────────────────────────────────────
+st.title("Tomato Price & Weather Dashboard")
 
-forecast = m.predict(future)
-prophet_pred = forecast["yhat"].iloc[-horizon:].values
+@st.cache_data
+def load_enriched():
+    return pd.read_csv(os.path.join(data_dir, "enriched_tomato.csv"), parse_dates=["Date"])
 
-# 6) Ensemble
-ens_pred = (xgb_pred + prophet_pred) / 2
+data = load_enriched()
 
-# 7) Plot historical + forecasts
-fig, ax = plt.subplots(figsize=(10,4))
-# last 2 years of actual
-window = horizon*2
-ax.plot(dfc.index[-window:], dfc["Price"].iloc[-window:], label="Actual", color="black")
-ax.plot(dates_test, xgb_pred,    label="XGB Forecast",    linestyle="--")
-ax.plot(dates_test, prophet_pred,label="Prophet Forecast", linestyle="-.")
-ax.plot(dates_test, ens_pred,    label="Ensemble",         linewidth=2, alpha=0.7)
-ax.set_title(f"{centre}: 12-Month Forecasts under {rain_shock:+}% Rainfall Shock")
-ax.set_ylabel("Price (₹)")
-ax.legend()
-st.pyplot(fig)
+# Sidebar filters
+centers = st.sidebar.multiselect(
+    "Select Center",
+    options=data["Center"].unique(),
+    default=list(data["Center"].unique())
+)
+min_date = data["Date"].min().date()
+max_date = data["Date"].max().date()
+date_min, date_max = st.sidebar.slider(
+    "Select Date Range",
+    min_value=min_date,
+    max_value=max_date,
+    value=(min_date, max_date),
+    format="YYYY-MM-DD"
+)
+filtered = data[
+    (data["Center"].isin(centers)) &
+    (data["Date"].dt.date.between(date_min, date_max))
+]
 
-# 8) RMSE metrics
-rmse_x = np.sqrt(mean_squared_error(y_test, xgb_pred))
-rmse_p = np.sqrt(mean_squared_error(y_test, prophet_pred))
-rmse_e = np.sqrt(mean_squared_error(y_test, ens_pred))
+# Main charts
+st.subheader("Price over Time")
+st.line_chart(
+    filtered.set_index("Date")["Price"].unstack(level=0),
+    use_container_width=True
+)
 
-st.subheader("📊 Forecast Accuracy (RMSE)")
-st.write(f"- XGBoost:   {rmse_x:0.2f}")
-st.write(f"- Prophet:   {rmse_p:0.2f}")
-st.write(f"- Ensemble:  {rmse_e:0.2f}")
+st.subheader("Rainfall & Temperature Trends")
+weather = filtered.set_index("Date")[['Rainfall', 'Temperature']]
+st.area_chart(weather, use_container_width=True)
 
-# 9) Simple ROI simulation
-st.subheader("💡 ROI Simulation")
-annual_benefit = cold_units * storage_credit * 12  # simplistic: credit × units × months
-st.write(f"- Storage credit per month: ₹{storage_credit:0.2f}")
-st.write(f"- Cold-chain units: {cold_units}")
-st.write(f"**→ Estimated annual benefit:** ₹{annual_benefit:,.2f}")
+st.subheader("Price Volatility")
+st.line_chart(
+    filtered.set_index("Date")["Volatility_12m"],
+    use_container_width=True
+)
 
+# Show raw data
+if st.checkbox("Show raw data"):
+    st.write(filtered.reset_index())
